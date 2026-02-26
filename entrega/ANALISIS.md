@@ -158,3 +158,63 @@ Dado que este dashboard se carga cada vez que un usuario hace login, ejecutar in
 **¿Cuándo invalidarla? (Caché Invalidation):**
 - **Invalidación por Evento (Event-Driven):** Se conecta a los observadores/modelos del ERP. Cada vez que el KardexController finaliza un `insertInto('kardex')` (cada que hay un movimiento de bodega), disparamos un job/worker en background que vacía la partición de la caché del producto afectado o regenera el JSON asíncronamente.
 - Al hacer Login, el usuario recibe el JSON de Redis en 2ms con una garantía del 100% del inventario real, y la base de datos SQL sobrevive intocable.
+
+---
+
+## 🔥 PARTE 4: Arquitectura - Decisión Técnica Real (15 pts)
+
+### 4.1 Análisis de Opciones (8 pts)
+
+- **Opción A: Sistema de colas con Redis/RabbitMQ**
+  - *Ventajas:* Totalmente asíncrono. Desacopla el ERP web de la lentitud de la SAT. Altamente escalable, con reintentos automáticos y concurrencia ajustable por workers.
+  - *Desventajas:* Requiere configuración y monitoreo de infraestructura adicional Servidor Redis y Supervisor de procesos.
+  - *Problemas potenciales:* Si el servicio del worker se cae o atasca, los recibos quedarán en espera silenciosamente hasta que se resuelva la infraestructura de la cola.
+- **Opción B: Cron job que procesa por lotes**
+  - *Ventajas:* Nativo, fácil y sin infraestructura de terceros. 
+  - *Desventajas:* Los lotes se procesan cada X minutos, causando retrasos de confirmación innecesarios. 
+  - *Problemas potenciales:* Si procesar 500 facturas toma 15 minutos y el cron está agendado cada 10, habrá un solapamiento de scripts mandando facturas duplicadas si no se usan Locks (Mutexes).
+- **Opción C: JavaScript que envía una por una con AJAX**
+  - *Ventajas:* Extremadamente fácil de hacer. Feedback visual.
+  - *Desventajas:* Depende completamente de la conexión y navegador del usuario.
+  - *Problemas potenciales:* Si el usuario cierra el navegador, minimiza o tiene un corte de luz en la factura 240, quedarán 260 facturas paralizadas, rompiendo la trazabilidad transaccional mensual en la SAT y dejando al ERP descuadrado.
+- **Opción D: Procesos paralelos con PHP (pcntl_fork)**
+  - *Ventajas:* Ejecuta código más rápido repartiendo trabajo a otros núcleos de CPU nativamente.
+  - *Desventajas:* La extensión `pcntl` casi siempre viene desactivada por seguridad en los servidores web (FPM/Apache). Está pensada solo para scripts de consola.
+  - *Problemas potenciales:* Es sumamente propenso a Memory Leaks, procesos Zombie y colisiones de adaptadores de Bases de Datos porque los 'hijos' nacen compartiendo el mismo puntero PDO a MySQL.
+
+### 4.2 Recomendación (7 pts)
+
+**Elegiría sin dudarlo la Opción A (Sistema de Colas).**
+*¿Por qué?* Porque las APIs gubernamentales (SAT, AFIP, Sunat) son famosas por sufrir caídas intermitentes, alta latencia timeouts y responder "Internal Server Error" en picos de facturación de fin de mes. Enviar 500 facturas de golpe por web bloquearía el hilo de PHP causando "Error 504 Gateway Timeout", y el usuario pensaría que nada funcionó.
+
+**Manejo de Fallos (Resiliencia):**
+El worker de la cola se configurará con Exponencial Backoff. Si la factura falla por timeout de la SAT, no aborta el lote. El job simplemente se reprograma automáticamente a la cola para intentar enviar esa misma factura en 1 min, si falla vuelve a ir a cola en 5 mins, y si falla 5 veces consecutivas se envía directo a una Dead Letter Queue Tabla `facturas_falladas`, pidiendo intervención manual o alertando al contador de la empresa.
+
+**Notificación al Usuario:**
+Dado que procesar todo tomará algunos minutos, debemos liberar al usuario inmediatamente:
+1.  Devolvemos "Petición Aceptada, procesando en segundo plano".
+2.  **Tiempo real:** Mediante WebSockets (Pushe/Laravel Echo), cada que un documento reciba el XML autorizado de la SAT se hace broadcast a un canal de la empresa, actualizando una barra de estado o creando una alerta nativa push estilo campanita en el nav superior del usuario.
+3.  **Híbrido (Económico):** Un Cron o Notificación final al concluir el lote que inyecta un registro en la base de datos y manda un correo de resumen ("De las 500 se facturaron 495 exitosamente, y 5 tuvieron un rechazo").
+
+**Esbozo de Arquitectura (Flux Típico ERP Moderno):**
+```mermaid
+sequenceDiagram
+    participant User as Contabilidad (Browser)
+    participant PHP as ERP App (Controller)
+    participant Redis as Cola en RAM (Redis)
+    participant Worker as Supervisor (CLI PHP Worker)
+    participant SAT as API Gubernamental (SAT)
+
+    User->>PHP: "Clic: Generar 500 Facturas"
+    PHP->>Redis: Inyectar 500 UUIDs (Jobs: [Id:1], [Id:2]...)
+    Note right of PHP: Tiempo real: 85 ms
+    PHP-->>User: 202 Accepted ("Procesando facturas por lote en segundo plano.")
+
+    loop Por cada Factura en la Cola
+        Worker->>Redis: Toma un Job (Factura_ID: 1)
+        Worker->>SAT: Petición HTTPS POST Firmada
+        SAT-->>Worker: Responde Token CFDI y XML (Tardó 2-3 segs)
+        Worker->>PHP: DB UPDATE: "Factura 1 => Timbrada"
+        Worker-->>User: Envía evento de WebSocket: "Progreso 1/500 o envía correo cuando finalice el loop"
+    end
+```
