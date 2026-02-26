@@ -275,3 +275,5 @@ public function exportarExcel() {
     exit; 
 }
 ```
+
+## NOTA: utilicé la rama MAIN por simplicidad y porque es una prueba técnica, en un escenario real crearía una rama para cada parte del análisis.
