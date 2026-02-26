@@ -51,3 +51,47 @@ El controlador ha sido reescrito para no ahondar en N+1 Queries:
    - En PHP se empareja todo con el listado principal con una complejidad final de tiempo de `O(N)` usando un diccionario hash en la memoria en vez de iterar.
 
 Se logra así mantener intacto el output del DataGrid a la vista `Kardex/IndexView` (`['producto', 'existencia', 'costo']`), respetando la compatibilidad de datos frontal requerida sin colapsar el motor.
+
+## 2.1 Análisis del Bug (10 pts)
+
+**Identificación del bug exacto:**
+El controlador actual sufre de múltiples errores de lógica simultáneos en el método `ProcesarTransformacion()`:
+1. **Tipo de Movimiento Invertido:** Al Café Cereza materia prima que se consume para transformarse se le hace una entrada (debería salir de bodega) y al Café Pergamino (producto obtenido) se le hace una salida (debería entrar a bodega).
+
+2. **Cantidad Idéntica sin Rendimiento:** La variable insertada para ambos productos es `$cantidad_entrada` (los 100qq), ignorando completamente que la transformación genera el nuevo producto pero con un porcentaje de rendimiento, de aquí nace la pérdida de inventario.
+
+3. **Ausencia de Transacciones ACID:** Ambos inserts se hacen de forma aislada. Si la base de datos se cae entre `$result1` y `$result2`, o falla el segundo insert, el inventario se corrompe parcialmente de por vida.
+
+**¿Por qué ocurre el problema de los 15 qq perdidos?**
+Al haber invertido Entradas/Salidas y no usar Merma:
+- El Café Cereza (mat. prima) aumentó en 100, cuando sus 100 debían haberse gastado.
+- El sistema forzó una salida (-100) de Pergamino porque usaron la misma variable (`$cantidad_entrada`), cuando en la realidad debió haber una entrada (+85) por su rendimiento. 
+- *Conclusión:* Tienen sobrante virtual inaudito en Cereza, y déficit grave por una "salida" gigante de Pergamino. En el cruce total de números se extravían 15 físicamente, y el ERP registra saldos contablemente opuestos a la realidad material.
+
+**¿Qué datos faltan en la tabla Kardex?**
+1. `precio_unitario`: El código del TransformacionController nunca inserta cuánto cuesta esta transacción. Esto arruina inmediatamente el método de costeo visto en la Parte 1.
+2. `referencia_transformacion`: Un ID o cadena para trazar qué lote de materia prima dio vida al nuevo lote de producto obtenido, vital para auditorías e inocuidad.
+
+---
+
+## 2.2 Solución Correcta (15 pts)
+
+**Estructura de Datos Propuesta y Lógica Implementada:**
+*Se ha implementado el código en `/entrega/codigo/TransformacionService.php` usando un estándar de Servicio Injectable (PSR-4).*
+- Se inició una transacción de Base de Datos (`$pdo->beginTransaction()`).
+- Se obtuvo el costo promedio unitario actual de la materia prima que se va a destruir y se calculó su costo total (Ej: 100qq * $50 = $5000 invertidos).
+- Se restó de bodega con `tipo = 'salida'` exactamente la `$cantidad_entrada` de la Materia prima.
+- Se calculó el rendimiento real usando el factor relacional (Ej: 100 * 0.85 = 85qq).
+- Se inyectó a bodega con `tipo = 'entrada'` exactamente la `$cantidadObtenida` (85qq) del Producto Transformado.
+- **Prorrateo de Costos:** Dado que gastamos $5000 en materia prima para obtener solo 85qq, el Nuevo Costo Unitario del café pergamino será de $58.82 (`$5000 / 85`). De esta forma ningún valor financiero se pierde por la merma física.
+- Todo se encapsuló en un try-catch con sentencias de Commit y Rollback.
+
+---
+
+## 2.3 Migración de Datos (10 pts)
+*El script SQL completo ha sido guardado en `/entrega/sql/migracion_transformaciones.sql`*.
+
+**Estrategia adoptada en SQL:**
+1. Crear un esquema lógico con sentencias `UPDATE` interrelacionadas haciendo `INNER JOIN` de la tabla `kardex` contra sí misma en base a las coincidencias temporales (`fecha`, `usuario_id`, `bodega_id`), identificando aquellos picos corruptos transaccionales donde entraron y salieron las mismas toneladas.
+2. Usar un `UPDATE` mutando el error: las falsas "entradas" pasar a "salidas" y corregir su cantidad conservando el 100% gastado; las falsas "salidas" a "entradas", multiplicando su valor base por el factor correspondiente `* 0.85`, reparando retroactivamente la merma jamás creada.
+3. Se han incluido condicionales estrictos `AND k_entrada.producto_id = 45` y `AND k_salida.producto_id = 67` para garantizar que la migración masiva aplique únicamente al café cereza y pergamino, blindando el resto de productos del catálogo contra posibles modificaciones de lote erróneas.
