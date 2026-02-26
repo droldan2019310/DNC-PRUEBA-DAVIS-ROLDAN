@@ -218,3 +218,60 @@ sequenceDiagram
         Worker-->>User: Envía evento de WebSocket: "Progreso 1/500 o envía correo cuando finalice el loop"
     end
 ```
+
+---
+
+## 🎯 BONUS: Debugging de Problema Bizarro (+10 pts)
+
+### ¿Cuál es el problema? (no es la respuesta obvia)
+El clásico error *"Headers already sent"* ocurre porque PHP envió el body al navegador HTTP antes de intentar declarar las cabeceras `header()`.
+Dado que es supuestamente aleatorio (~30% de veces) y el archivo sale corrupto, el problema no es un echo, un print ni un espacio en blanco flotante convencional en el controlador.
+
+Las causas reales basadas en las pistas dadas (FPM vs Apache, PHP 8.1 vs 7.4) son dos grandes candidatos concurrentes:
+
+1. **Variables o Warnings no capturados bajo PHP 8.1 (Output Buffering Mismatch):**
+   - En Desarrollo (Apache 2.4, PHP 7.4), Apache suele usar `output_buffering = 4096` en `php.ini` por defecto. Cualquier `Warning` o espacio en blanco oculto no se envía hasta llenar 4KB, permitiendo procesar el `header()` a salvo.
+   - En Producción (Nginx + PHP-FPM), `output_buffering` suele venir apagado (`Off`) por ser modo fastCgi. Si un `$row` proveniente de `$datos` dispara un simple Warning de depreciación leve al instanciarse ese texto de warning rompe el ciclo del HTTP header. Ese 30% aleatorio es la probabilidad de que una de las consultas en base de datos traiga un campo nulo o de un tipo de dato que el código PHP 8 no permite en esa tabla, emitiendo el desbordamiento.
+   
+2. **Inclusiones de Archivos en Runtime y el BOM Invisible:**
+   - La librería `ExcelBuilder` o modelos traen una firma o si hubo un cambio de framework/cache que inyecta caracteres residuales nulos (espacios al final del archivo PHP `?>`). 
+
+### ¿Cómo lo debuggearías en producción?
+1. Revisando el Log exacto de Nginx/FPM donde falla. Nos dirá la línea exacta donde saltó el error `headers already sent in ExcelBuilder.php on line 45`.
+2. Utilizando **`headers_sent($file, $line)`** nativo dentro del controlador.
+```php
+if (headers_sent($file, $line)) {
+    die("Fuga de headers detectada en $file línea $line antes de generar el Excel"); 
+}
+```
+
+### ¿Cuál es la solución definitiva?
+Para la estabilidad total del flujo de archivos en PHP, especialmente forzando descargas, la solución arquitectónica es usar manejo activo y estricto del búfer de salida encapsulando el contenido y silenciando warnings leves que rompan el archivo binario.
+
+```php
+public function exportarExcel() {
+    $this->requireAuth();
+    
+    // 1. Limpiar cualquier basura residual atrapada viva antes del controlador
+    if (ob_get_length()) {
+        ob_clean(); 
+    }
+    
+    $datos = $this->repository->getAll();
+    $excel = new ExcelBuilder();
+    foreach ($datos as $row) {
+        $excel->addRow($row);
+    }
+    
+    // 2. Definir los headers estrictamente despues de ejecutar toda la lógica
+    header('Content-Type: application/vnd.ms-excel');
+    header('Content-Disposition: attachment; filename="reporte.xlsx"');
+    header('Cache-Control: max-age=0');
+    
+    // Imprimir el binario crudo
+    echo $excel->generate();
+    
+    // 3. Forzar el cierre de la solicitud
+    exit; 
+}
+```
